@@ -31,6 +31,7 @@ SpecForge is an ecosystem project developed by the SGLang team. It is a framewor
    :caption: Advanced Features
 
    advanced_features/customization.md
+   advanced_features/dflash_target_distillation.md
 
 .. toctree::
    :maxdepth: 1

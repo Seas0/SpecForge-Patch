@@ -11,6 +11,11 @@ export TORCHINDUCTOR_CACHE_DIR=$ROOT_DIR/cache/compiled_kernels
 
 ATTENTION_BACKEND=${2:-flex_attention}
 NUM_GPUS=4
+DFLASH_CKPT_DIR=${DFLASH_CKPT_DIR:-}
+DFLASH_CKPT_ARGS=()
+if [ -n "$DFLASH_CKPT_DIR" ]; then
+    DFLASH_CKPT_ARGS=(--ckpt-dir "$DFLASH_CKPT_DIR")
+fi
 
 CUDA_VISIBLE_DEVICES=4,5,6,7 torchrun \
     --standalone \
@@ -18,6 +23,7 @@ CUDA_VISIBLE_DEVICES=4,5,6,7 torchrun \
     $ROOT_DIR/scripts/train_dflash.py \
     --target-model-path /data/jiapingW/pretrained_models/Qwen3.5-35B-A3B \
     --draft-config-path $ROOT_DIR/configs/qwen3.5-35b-a3b-dflash.json \
+    "${DFLASH_CKPT_ARGS[@]}" \
     --train-data-path $ROOT_DIR/cache/dataset/opc_train_regen_first_turn.jsonl \
     --output-dir $ROOT_DIR/outputs/qwen3.5-35a-a3b-dflash-opc \
     --num-epochs 10 \

@@ -37,6 +37,10 @@ python scripts/prepare_data.py --dataset sharegpt
 bash ./examples/run_llama3.1_8b_eagle3_online.sh
 ```
 
+DFlash online training uses `scripts/train_dflash.py`. For output-side
+target-logit distillation over the target model's top-k or top-p candidate
+tokens, see [DFlash Target-Logit Distillation](../advanced_features/dflash_target_distillation.md).
+
 ## 💨 Offline Training
 
 The difference between online and offline training is that we need to generate the hidden states before training. We also use ShareGPT and Llama3-8B-Instruct as an example.

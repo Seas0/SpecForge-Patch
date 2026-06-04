@@ -11,6 +11,11 @@ BUILD_DATASET_NUM_PROC=${BUILD_DATASET_NUM_PROC:-64}
 WANDB_MODE=offline
 SGL_JIT_DEEPGEMM_PRECOMPILE=false
 SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1
+DFLASH_CKPT_DIR=${DFLASH_CKPT_DIR:-}
+DFLASH_CKPT_ARGS=()
+if [ -n "$DFLASH_CKPT_DIR" ]; then
+    DFLASH_CKPT_ARGS=(--ckpt-dir "$DFLASH_CKPT_DIR")
+fi
 
 torchrun \
     --standalone \
@@ -23,6 +28,7 @@ torchrun \
     --sglang-mem-fraction-static 0.75 \
     --sglang-ep-size $NUM_GPUS \
     --draft-config-path $ROOT_DIR/configs/longcat-flash-dflash.json \
+    "${DFLASH_CKPT_ARGS[@]}" \
     --train-data-path $ROOT_DIR/cache/dataset/sharegpt_train.jsonl \
     --build-dataset-num-proc $BUILD_DATASET_NUM_PROC \
     --output-dir $ROOT_DIR/outputs/longcat-flash-dflash-sharegpt \

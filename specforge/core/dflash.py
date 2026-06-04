@@ -1,13 +1,14 @@
 # coding=utf-8
 """DFlash Training Wrapper."""
 
-from typing import Optional, Tuple
+from typing import Optional, TYPE_CHECKING, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from specforge.modeling.draft.dflash import DFlashDraftModel
+if TYPE_CHECKING:
+    from specforge.modeling.draft.dflash import DFlashDraftModel
 
 try:
     from torch.nn.attention.flex_attention import BlockMask, create_block_mask
@@ -93,12 +94,88 @@ def create_dflash_block_mask(
     )
 
 
+def compute_topk_target_distillation_loss(
+    student_logits: torch.Tensor,
+    target_logits: torch.Tensor,
+    target_logit_indices: torch.Tensor,
+    weight_mask: torch.Tensor,
+    top_k: int,
+    temperature: float,
+    top_p: Optional[float] = None,
+) -> torch.Tensor:
+    """Top-k target-logit distillation for draft output logits.
+
+    `target_logit_indices` points to target positions whose logits predict the
+    draft labels. For causal LMs, token at position p is predicted by target
+    logits at p - 1. If provided, `top_p` filters low-probability tokens inside
+    the selected top-k candidate set and then renormalizes the target weights.
+    """
+    if top_k < 1:
+        raise ValueError("top_k must be >= 1")
+    if temperature <= 0:
+        raise ValueError("temperature must be positive")
+    if top_p is not None and not 0.0 < top_p <= 1.0:
+        raise ValueError("top_p must be in (0, 1]")
+    if student_logits.ndim != 3:
+        raise ValueError(
+            f"student_logits must have shape [batch, seq, vocab], got {tuple(student_logits.shape)}"
+        )
+    if target_logits.ndim != 3:
+        raise ValueError(
+            f"target_logits must have shape [batch, seq, vocab], got {tuple(target_logits.shape)}"
+        )
+    if target_logit_indices.shape != student_logits.shape[:2]:
+        raise ValueError(
+            "target_logit_indices must have shape matching student_logits[:2]"
+        )
+    if weight_mask.shape != student_logits.shape[:2]:
+        raise ValueError("weight_mask must have shape matching student_logits[:2]")
+    if student_logits.shape[0] != target_logits.shape[0]:
+        raise ValueError("student and target batch sizes must match")
+    if student_logits.shape[-1] != target_logits.shape[-1]:
+        raise ValueError("student and target vocab sizes must match")
+
+    batch_size, target_seq_len, vocab_size = target_logits.shape
+    safe_indices = target_logit_indices.clamp(min=0, max=target_seq_len - 1)
+    gathered_target_logits = torch.gather(
+        target_logits.detach(),
+        1,
+        safe_indices.unsqueeze(-1).expand(batch_size, -1, vocab_size),
+    )
+
+    selected_k = min(top_k, vocab_size)
+    target_top_logits, target_top_indices = torch.topk(
+        gathered_target_logits.to(torch.float32) / temperature,
+        selected_k,
+        dim=-1,
+    )
+    target_top_probs = F.softmax(target_top_logits, dim=-1)
+    if top_p is not None and top_p < 1.0:
+        cumulative_probs = torch.cumsum(target_top_probs, dim=-1)
+        top_p_mask = (cumulative_probs - target_top_probs) < top_p
+        top_p_mask[..., 0] = True
+        target_top_probs = target_top_probs * top_p_mask.to(target_top_probs.dtype)
+        target_top_probs = target_top_probs / target_top_probs.sum(
+            dim=-1, keepdim=True
+        ).clamp_min(1e-12)
+
+    student_log_probs = F.log_softmax(
+        student_logits.to(torch.float32) / temperature, dim=-1
+    )
+    student_top_log_probs = torch.gather(student_log_probs, -1, target_top_indices)
+
+    loss_per_token = -(target_top_probs * student_top_log_probs).sum(dim=-1)
+    loss_per_token = loss_per_token * (temperature**2)
+    weights = weight_mask.to(loss_per_token.dtype)
+    return (loss_per_token * weights).sum() / (weights.sum() + 1e-6)
+
+
 class OnlineDFlashModel(nn.Module):
     """DFlash online training wrapper with block-wise CE loss."""
 
     def __init__(
         self,
-        draft_model: DFlashDraftModel,
+        draft_model: "DFlashDraftModel",
         target_lm_head: nn.Module,
         target_embed_tokens: nn.Module,
         mask_token_id: int,
@@ -106,8 +183,24 @@ class OnlineDFlashModel(nn.Module):
         attention_backend: str = "flex_attention",
         num_anchors: int = 512,
         loss_decay_gamma: Optional[float] = None,
+        target_distillation_weight: float = 0.0,
+        target_distillation_top_k: int = 3,
+        target_distillation_top_p: Optional[float] = None,
+        target_distillation_temperature: float = 1.0,
     ):
         super().__init__()
+        if target_distillation_weight < 0:
+            raise ValueError("target_distillation_weight must be non-negative")
+        if target_distillation_top_k < 1:
+            raise ValueError("target_distillation_top_k must be >= 1")
+        if target_distillation_temperature <= 0:
+            raise ValueError("target_distillation_temperature must be positive")
+        if (
+            target_distillation_top_p is not None
+            and not 0.0 < target_distillation_top_p <= 1.0
+        ):
+            raise ValueError("target_distillation_top_p must be in (0, 1]")
+
         self.draft_model = draft_model
         self.lm_head = target_lm_head
         self.embed_tokens = target_embed_tokens
@@ -116,6 +209,10 @@ class OnlineDFlashModel(nn.Module):
         self.attention_backend = attention_backend
         self.num_anchors = num_anchors
         self.loss_decay_gamma = loss_decay_gamma
+        self.target_distillation_weight = target_distillation_weight
+        self.target_distillation_top_k = target_distillation_top_k
+        self.target_distillation_top_p = target_distillation_top_p
+        self.target_distillation_temperature = target_distillation_temperature
 
         self._cached_block_mask: Optional[BlockMask] = None
         self._cached_seq_len: Optional[int] = None
@@ -216,6 +313,7 @@ class OnlineDFlashModel(nn.Module):
         input_ids: torch.Tensor,
         hidden_states: torch.Tensor,
         loss_mask: torch.Tensor,
+        target_logits: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Parallel block-wise training forward pass."""
         bsz, seq_len = input_ids.shape
@@ -307,6 +405,23 @@ class OnlineDFlashModel(nn.Module):
         loss_per_token = F.cross_entropy(flat_logits, flat_targets, reduction="none")
         valid_token_count = flat_weights.sum() + 1e-6
         loss = (loss_per_token * flat_weights).sum() / valid_token_count
+
+        if self.target_distillation_weight > 0:
+            if target_logits is None:
+                raise ValueError(
+                    "target_logits must be provided when target_distillation_weight > 0"
+                )
+            target_logit_indices = (label_indices.view(bsz, -1) - 1).clamp(min=0)
+            kd_loss = compute_topk_target_distillation_loss(
+                student_logits=logits,
+                target_logits=target_logits,
+                target_logit_indices=target_logit_indices,
+                weight_mask=weight_mask.view(bsz, -1),
+                top_k=self.target_distillation_top_k,
+                temperature=self.target_distillation_temperature,
+                top_p=self.target_distillation_top_p,
+            )
+            loss = loss + self.target_distillation_weight * kd_loss
 
         # --- Accuracy ---
         with torch.no_grad():

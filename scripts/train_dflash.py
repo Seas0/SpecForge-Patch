@@ -117,6 +117,41 @@ def parse_args():
     training_group.add_argument("--accumulation-steps", type=int, default=1)
     training_group.add_argument("--seed", type=int, default=42)
     training_group.add_argument("--resume", action="store_true")
+    training_group.add_argument(
+        "--ckpt-dir",
+        "--init-draft-model-path",
+        dest="ckpt_dir",
+        type=str,
+        default=None,
+        help="Pretrained DFlash draft checkpoint directory or Hugging Face repo to initialize from. "
+        "--resume still takes precedence when an output-dir training checkpoint exists.",
+    )
+
+    distill_group = parser.add_argument_group("target distillation")
+    distill_group.add_argument(
+        "--target-distillation-weight",
+        type=float,
+        default=0.0,
+        help="Weight for output-side top-k target-logit distillation. 0 disables.",
+    )
+    distill_group.add_argument(
+        "--target-distillation-top-k",
+        type=int,
+        default=3,
+        help="Number of target top-k logits used for distillation.",
+    )
+    distill_group.add_argument(
+        "--target-distillation-top-p",
+        type=float,
+        default=None,
+        help="Optional nucleus cutoff applied within target top-k candidates.",
+    )
+    distill_group.add_argument(
+        "--target-distillation-temperature",
+        type=float,
+        default=1.0,
+        help="Temperature for target top-k distillation.",
+    )
 
     output_group = parser.add_argument_group("output")
     output_group.add_argument("--output-dir", type=str, required=True)
@@ -166,7 +201,10 @@ def build_models(args) -> Tuple[DFlashTargetModel, DFlashDraftModel]:
     )
 
     if args.draft_config_path:
-        draft_config = AutoConfig.from_pretrained(args.draft_config_path)
+        draft_config = AutoConfig.from_pretrained(
+            args.draft_config_path,
+            trust_remote_code=args.trust_remote_code,
+        )
         print_on_rank0(f"Loaded draft config from {args.draft_config_path}")
         # Warn if command-line args differ from config
         if (
@@ -178,8 +216,14 @@ def build_models(args) -> Tuple[DFlashTargetModel, DFlashDraftModel]:
                 f"command-line arg ({args.block_size}). Using checkpoint value."
             )
     else:
-        target_config = AutoConfig.from_pretrained(args.target_model_path)
-        draft_config = AutoConfig.from_pretrained(args.target_model_path)
+        target_config = AutoConfig.from_pretrained(
+            args.target_model_path,
+            trust_remote_code=args.trust_remote_code,
+        )
+        draft_config = AutoConfig.from_pretrained(
+            args.target_model_path,
+            trust_remote_code=args.trust_remote_code,
+        )
         draft_config.num_hidden_layers = args.num_draft_layers
         draft_config.block_size = args.block_size
         draft_config.num_target_layers = target_config.num_hidden_layers
@@ -353,40 +397,89 @@ def main():
     )
 
     args = parse_args()
+    if args.target_distillation_weight < 0:
+        raise ValueError("--target-distillation-weight must be non-negative")
+    if args.target_distillation_top_k < 1:
+        raise ValueError("--target-distillation-top-k must be >= 1")
+    if (
+        args.target_distillation_top_p is not None
+        and not 0.0 < args.target_distillation_top_p <= 1.0
+    ):
+        raise ValueError("--target-distillation-top-p must be in (0, 1]")
+    if args.target_distillation_temperature <= 0:
+        raise ValueError("--target-distillation-temperature must be positive")
+    if args.target_distillation_weight > 0 and args.target_model_backend != "hf":
+        raise ValueError("target distillation currently requires --target-model-backend hf")
+
     set_seed(args.seed)
 
     init_distributed(timeout=args.dist_timeout, tp_size=args.tp_size)
     print_with_rank("Initialized distributed")
 
-    draft_model_last_checkpoint = None
+    draft_model_init_checkpoint = args.ckpt_dir
+    resume_checkpoint = None
     ckpt_info = (0, 0)
-    if args.resume and os.path.isdir(args.output_dir):
-        draft_model_last_checkpoint, ckpt_info = get_last_checkpoint(args.output_dir)
-        print(f"Last checkpoint detected: {draft_model_last_checkpoint}")
-
-    # If resuming, load config from checkpoint to ensure consistency
-    if draft_model_last_checkpoint:
-        checkpoint_config_path = os.path.join(
-            draft_model_last_checkpoint, "config.json"
+    if draft_model_init_checkpoint:
+        print_on_rank0(
+            f"Initializing draft model from pretrained checkpoint: {draft_model_init_checkpoint}"
         )
-        if os.path.exists(checkpoint_config_path):
-            print(f"Loading draft config from checkpoint: {checkpoint_config_path}")
-            args.draft_config_path = checkpoint_config_path
+
+    if args.resume and os.path.isdir(args.output_dir):
+        resume_checkpoint, ckpt_info = get_last_checkpoint(args.output_dir)
+        if resume_checkpoint:
+            draft_model_init_checkpoint = resume_checkpoint
+            print_on_rank0(f"Last checkpoint detected: {resume_checkpoint}")
+        elif args.ckpt_dir:
+            print_on_rank0(
+                f"--resume set but no checkpoint was found in {args.output_dir}; "
+                f"starting from pretrained checkpoint {args.ckpt_dir}."
+            )
+        else:
+            print_on_rank0(
+                f"--resume set but no checkpoint was found in {args.output_dir}; "
+                "starting from a freshly initialized draft model."
+            )
+    elif args.resume:
+        if args.ckpt_dir:
+            print_on_rank0(
+                f"--resume set but output dir does not exist: {args.output_dir}; "
+                f"starting from pretrained checkpoint {args.ckpt_dir}."
+            )
+        else:
+            print_on_rank0(
+                f"--resume set but output dir does not exist: {args.output_dir}; "
+                "starting from a freshly initialized draft model."
+            )
+
+    # If initializing from a checkpoint, use its config to keep tensor shapes aligned.
+    if draft_model_init_checkpoint:
+        if (
+            args.draft_config_path
+            and args.draft_config_path != draft_model_init_checkpoint
+        ):
+            print_on_rank0(
+                f"Using draft config from {draft_model_init_checkpoint}; "
+                f"overriding --draft-config-path {args.draft_config_path}."
+            )
+        args.draft_config_path = draft_model_init_checkpoint
 
     target_model, draft_model = build_models(args)
 
     resume_state = None
-    if draft_model_last_checkpoint:
+    if draft_model_init_checkpoint:
         loaded_model = DFlashDraftModel.from_pretrained(
-            draft_model_last_checkpoint, torch_dtype=torch.bfloat16
+            draft_model_init_checkpoint,
+            torch_dtype=torch.bfloat16,
+            trust_remote_code=args.trust_remote_code,
         )
         draft_model.load_state_dict(loaded_model.state_dict())
         del loaded_model
-        print("Loaded draft model weights from checkpoint")
-
-        training_state_path = os.path.join(
-            draft_model_last_checkpoint, "training_state.pt"
+        print_on_rank0(
+            f"Loaded draft model weights from {draft_model_init_checkpoint}"
         )
+
+    if resume_checkpoint:
+        training_state_path = os.path.join(resume_checkpoint, "training_state.pt")
         if os.path.exists(training_state_path):
             resume_state = torch.load(
                 training_state_path, map_location="cpu", weights_only=False
@@ -410,6 +503,18 @@ def main():
     draft_model.mask_token_id = mask_token_id
     draft_model.config.dflash_config["mask_token_id"] = mask_token_id
     draft_model.config.dflash_config["target_layer_ids"] = draft_model.target_layer_ids
+    draft_model.config.dflash_config["target_distillation_weight"] = (
+        args.target_distillation_weight
+    )
+    draft_model.config.dflash_config["target_distillation_top_k"] = (
+        args.target_distillation_top_k
+    )
+    draft_model.config.dflash_config["target_distillation_top_p"] = (
+        args.target_distillation_top_p
+    )
+    draft_model.config.dflash_config["target_distillation_temperature"] = (
+        args.target_distillation_temperature
+    )
     print_on_rank0(f"dflash_config: {draft_model.config.dflash_config}")
 
     train_dataloader, eval_dataloader = build_dataloader(args, tokenizer)
@@ -436,6 +541,10 @@ def main():
         attention_backend=args.attention_backend,
         num_anchors=args.num_anchors,
         loss_decay_gamma=args.loss_decay_gamma,
+        target_distillation_weight=args.target_distillation_weight,
+        target_distillation_top_k=args.target_distillation_top_k,
+        target_distillation_top_p=args.target_distillation_top_p,
+        target_distillation_temperature=args.target_distillation_temperature,
     )
 
     dflash_model = FSDP(
@@ -508,6 +617,7 @@ def main():
                 input_ids=input_ids,
                 hidden_states=hidden_states,
                 loss_mask=loss_mask,
+                target_logits=target_output.logits,
             )
 
             (loss / args.accumulation_steps).backward()

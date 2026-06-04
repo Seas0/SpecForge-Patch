@@ -7,6 +7,11 @@ export SPECFORGE_DATA_NUM_PROC=32
 NUM_GPUS=${1:-8}
 
 ATTENTION_BACKEND=${2:-flex_attention}
+DFLASH_CKPT_DIR=${DFLASH_CKPT_DIR:-}
+DFLASH_CKPT_ARGS=()
+if [ -n "$DFLASH_CKPT_DIR" ]; then
+    DFLASH_CKPT_ARGS=(--ckpt-dir "$DFLASH_CKPT_DIR")
+fi
 
 torchrun \
     --standalone \
@@ -14,6 +19,7 @@ torchrun \
     $ROOT_DIR/scripts/train_dflash.py \
     --target-model-path Qwen/Qwen3-8B \
     --draft-config-path $ROOT_DIR/configs/qwen3-8b-dflash.json \
+    "${DFLASH_CKPT_ARGS[@]}" \
     --train-data-path $ROOT_DIR/cache/dataset/perfectblend_qwen3-8b_regen.jsonl \
     --output-dir $ROOT_DIR/outputs/qwen3-8b-perfectblend \
     --num-epochs 6 \
